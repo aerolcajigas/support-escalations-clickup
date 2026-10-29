@@ -1,0 +1,231 @@
+{
+  "name": "Escalations / Intercom to ClickUp",
+  "nodes": [
+    {
+      "id": "39ebcf5f-7b88-4d7e-8cc4-0b3792595b84",
+      "name": "Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "63eff1d5-96f6-48a0-87c6-80191b0a4634",
+      "name": "Search Escalated",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "intercomApi": {
+          "id": "INTERCOM_CREDENTIAL_ID",
+          "name": "Intercom API"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.intercom.io/conversations/search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "intercomApi",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Intercom-Version",
+              "value": "2.11"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: { operator: 'AND', value: [{ field: 'tag_ids', operator: 'IN', value: [\"7654321\"] }, { field: 'updated_at', operator: '>', value: Math.floor(Date.now() / 1000) - 60 * 60 }] }, pagination: { per_page: 50 } }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "2fe8fa2d-33be-468c-81f8-96b7d4d3895e",
+      "name": "New Conversations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Escalated support conversations (Zendesk tickets, Intercom conversations) -> ClickUp tasks for the team that has to\n// act, with an SLA due date. When the task is closed in ClickUp, the ticket/conversation gets an internal note.\n// Plain JS, no imports: build.mjs pastes it into the n8n Code nodes; the tests run the same functions.\n\nconst DEFAULTS = {\n  zendeskSubdomain: 'yourcompany',\n  intercomAppId: 'your-app-id',\n  linkedTag: 'clickup_linked',      // Zendesk tag added once a task exists (the Zendesk trigger should exclude it)\n  doneStatuses: ['complete', 'closed', 'done', 'resolved'],\n  slaHours: { urgent: 4, high: 24, normal: 72, low: 168 },\n  maxSeen: 2000,                    // Intercom conversation ids remembered to avoid duplicate tasks\n};\nconst cfgOf = (c) => ({ ...DEFAULTS, ...(c || {}), slaHours: { ...DEFAULTS.slaHours, ...((c && c.slaHours) || {}) } });\nconst CLICKUP_PRIORITY = { urgent: 1, high: 2, normal: 3, low: 4 };\nconst clip = (s, n) => { s = String(s || '').replace(/\\s+\\n/g, '\\n').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };\nconst stripHtml = (s) => String(s || '').replace(/<br\\s*\\/?>/gi, '\\n').replace(/<\\/p>/gi, '\\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();\n\n// The source reference goes in the task name so the close-the-loop workflow can find its way back without a database.\nconst refTag = (source, id) => `[${source}#${id}]`;\nfunction parseRef(name) {\n  const m = String(name || '').match(/\\[(zendesk|intercom)#([A-Za-z0-9_-]+)\\]\\s*$/);\n  return m ? { source: m[1], id: m[2] } : null;\n}\n\nfunction dueDate(priority, now, c) {\n  const cfg = cfgOf(c);\n  return new Date(now).getTime() + (cfg.slaHours[priority] || cfg.slaHours.normal) * 3600000;\n}\n\n// ---------- Zendesk ----------\n// Zendesk priority (urgent/high/normal/low or null) maps straight across; missing = normal.\nfunction taskFromZendesk(res, now, c) {\n  const cfg = cfgOf(c);\n  const t = res && res.ticket;\n  if (!t) return { skip: 'no ticket' };\n  if ((t.tags || []).includes(cfg.linkedTag)) return { skip: 'already linked' };\n  const requester = (res.users || []).find((u) => u.id === t.requester_id) || {};\n  const priority = CLICKUP_PRIORITY[t.priority] ? t.priority : 'normal';\n  const url = `https://${cfg.zendeskSubdomain}.zendesk.com/agent/tickets/${t.id}`;\n  return {\n    source: 'zendesk', sourceId: String(t.id),\n    task: {\n      name: `${clip(t.subject || 'Zendesk ticket', 120)} ${refTag('zendesk', t.id)}`,\n      markdown_description: [`**From Zendesk:** [ticket #${t.id}](${url})`, `**Customer:** ${requester.name || ''} ${requester.email ? `<${requester.email}>` : ''}`.trim(),\n        `**Priority:** ${priority} · **Tags:** ${(t.tags || []).join(', ') || 'none'}`, '', clip(t.description, 3000)].join('\\n'),\n      priority: CLICKUP_PRIORITY[priority], due_date: dueDate(priority, now, cfg), due_date_time: true, tags: ['support', 'zendesk'],\n    },\n  };\n}\n\n// ---------- Intercom ----------\n// Search API results -> conversations that don't have a task yet. seen: { [conversationId]: linkedAtIso } in workflow\n// static data. Ids are only remembered after the task exists (rememberSeen), so a failed ClickUp call is retried\n// on the next run instead of being lost.\nfunction newIntercomConversations(res, seen) {\n  return ((res && res.conversations) || []).filter((conv) => !(seen || {})[conv.id]);\n}\nfunction rememberSeen(seen, ids, now, c) {\n  const cfg = cfgOf(c);\n  const state = { ...(seen || {}) };\n  for (const id of ids) state[id] = new Date(now).toISOString();\n  const all = Object.keys(state);\n  if (all.length > cfg.maxSeen) all.sort((a, b) => state[a].localeCompare(state[b])).slice(0, all.length - cfg.maxSeen).forEach((id) => delete state[id]);\n  return state;\n}\n\nfunction taskFromIntercom(conv, now, c) {\n  const cfg = cfgOf(c);\n  const src = conv.source || {};\n  const author = src.author || {};\n  const priority = conv.priority === 'priority' ? 'high' : 'normal';\n  const url = `https://app.intercom.com/a/inbox/${cfg.intercomAppId}/inbox/conversation/${conv.id}`;\n  const subject = stripHtml(src.subject) || clip(stripHtml(src.body), 80) || 'Intercom conversation';\n  return {\n    source: 'intercom', sourceId: String(conv.id),\n    task: {\n      name: `${clip(subject, 120)} ${refTag('intercom', conv.id)}`,\n      markdown_description: [`**From Intercom:** [conversation ${conv.id}](${url})`, `**Customer:** ${author.name || ''} ${author.email ? `<${author.email}>` : ''}`.trim(),\n        `**Priority:** ${priority}`, '', clip(stripHtml(src.body), 3000)].join('\\n'),\n      priority: CLICKUP_PRIORITY[priority], due_date: dueDate(priority, now, cfg), due_date_time: true, tags: ['support', 'intercom'],\n    },\n  };\n}\n\n// Intercom search for conversations carrying the escalation tag, updated since `sinceSec`.\nfunction intercomSearch(tagId, sinceSec) {\n  return { query: { operator: 'AND', value: [{ field: 'tag_ids', operator: 'IN', value: [String(tagId)] }, { field: 'updated_at', operator: '>', value: sinceSec }] },\n    pagination: { per_page: 50 } };\n}\n\n// ---------- after the task is created ----------\nconst intercomNote = (cfg, text) => ({ message_type: 'note', type: 'admin', admin_id: String(cfg.intercomAdminId), body: `<p>${text.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</p>` });\n\nfunction linkBack(item, task, c) {\n  const cfg = cfgOf(c);\n  if (!task || !task.id) throw new Error(`ClickUp did not return a task for ${item.source} ${item.sourceId}`);\n  const text = `Escalated to ClickUp: ${task.url} (due ${new Date(Number(task.due_date)).toISOString().slice(0, 16).replace('T', ' ')} UTC)`;\n  if (item.source === 'zendesk') return { source: 'zendesk', id: item.sourceId, body: { ticket: { comment: { body: text, public: false }, additional_tags: [cfg.linkedTag] } } };\n  return { source: 'intercom', id: item.sourceId, body: intercomNote(cfg, text) };\n}\n\n// ---------- ClickUp task closed -> note on the source ----------\n// hook: ClickUp webhook payload (taskStatusUpdated). task: GET /task/{id}. Returns null when nothing to do.\nfunction closeNote(hook, task, c) {\n  const cfg = cfgOf(c);\n  const change = ((hook && hook.history_items) || []).find((h) => h.field === 'status');\n  const after = change && change.after;\n  const status = String((after && after.status) || (task.status && task.status.status) || '').toLowerCase();\n  const closed = (after && after.type === 'closed') || cfg.doneStatuses.includes(status);\n  if (!closed) return null;\n  const ref = parseRef(task.name);\n  if (!ref) return null;\n  const text = `ClickUp task \"${task.name.replace(/\\s*\\[.*\\]$/, '')}\" was marked ${status || 'done'}: ${task.url}`;\n  if (ref.source === 'zendesk') return { source: 'zendesk', id: ref.id, body: { ticket: { comment: { body: text, public: false } } } };\n  return { source: 'intercom', id: ref.id, body: intercomNote(cfg, text) };\n}\n\nconst CONFIG = {\"zendeskSubdomain\":\"yourcompany\",\"intercomAppId\":\"your-app-id\",\"intercomAdminId\":\"1234567\",\"linkedTag\":\"clickup_linked\",\"doneStatuses\":[\"complete\",\"closed\",\"done\",\"resolved\"],\"slaHours\":{\"urgent\":4,\"high\":24,\"normal\":72,\"low\":168}};\n\n// ---- New Conversations ----\nconst seen = $getWorkflowStaticData('global').seen;\nconst now = new Date().toISOString();\nreturn newIntercomConversations($input.first().json, seen).map((conv) => ({ json: taskFromIntercom(conv, now, CONFIG) }));\n"
+      }
+    },
+    {
+      "id": "b40a72e2-3fb6-49b1-94d2-dd29f878787b",
+      "name": "Create ClickUp Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "clickUpApi": {
+          "id": "CLICKUP_CREDENTIAL_ID",
+          "name": "ClickUp API"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.clickup.com/api/v2/list/900000000000/task",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "clickUpApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.task) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "824764f9-a13a-441f-b501-72fe08a1a612",
+      "name": "Link Back",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Escalated support conversations (Zendesk tickets, Intercom conversations) -> ClickUp tasks for the team that has to\n// act, with an SLA due date. When the task is closed in ClickUp, the ticket/conversation gets an internal note.\n// Plain JS, no imports: build.mjs pastes it into the n8n Code nodes; the tests run the same functions.\n\nconst DEFAULTS = {\n  zendeskSubdomain: 'yourcompany',\n  intercomAppId: 'your-app-id',\n  linkedTag: 'clickup_linked',      // Zendesk tag added once a task exists (the Zendesk trigger should exclude it)\n  doneStatuses: ['complete', 'closed', 'done', 'resolved'],\n  slaHours: { urgent: 4, high: 24, normal: 72, low: 168 },\n  maxSeen: 2000,                    // Intercom conversation ids remembered to avoid duplicate tasks\n};\nconst cfgOf = (c) => ({ ...DEFAULTS, ...(c || {}), slaHours: { ...DEFAULTS.slaHours, ...((c && c.slaHours) || {}) } });\nconst CLICKUP_PRIORITY = { urgent: 1, high: 2, normal: 3, low: 4 };\nconst clip = (s, n) => { s = String(s || '').replace(/\\s+\\n/g, '\\n').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };\nconst stripHtml = (s) => String(s || '').replace(/<br\\s*\\/?>/gi, '\\n').replace(/<\\/p>/gi, '\\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();\n\n// The source reference goes in the task name so the close-the-loop workflow can find its way back without a database.\nconst refTag = (source, id) => `[${source}#${id}]`;\nfunction parseRef(name) {\n  const m = String(name || '').match(/\\[(zendesk|intercom)#([A-Za-z0-9_-]+)\\]\\s*$/);\n  return m ? { source: m[1], id: m[2] } : null;\n}\n\nfunction dueDate(priority, now, c) {\n  const cfg = cfgOf(c);\n  return new Date(now).getTime() + (cfg.slaHours[priority] || cfg.slaHours.normal) * 3600000;\n}\n\n// ---------- Zendesk ----------\n// Zendesk priority (urgent/high/normal/low or null) maps straight across; missing = normal.\nfunction taskFromZendesk(res, now, c) {\n  const cfg = cfgOf(c);\n  const t = res && res.ticket;\n  if (!t) return { skip: 'no ticket' };\n  if ((t.tags || []).includes(cfg.linkedTag)) return { skip: 'already linked' };\n  const requester = (res.users || []).find((u) => u.id === t.requester_id) || {};\n  const priority = CLICKUP_PRIORITY[t.priority] ? t.priority : 'normal';\n  const url = `https://${cfg.zendeskSubdomain}.zendesk.com/agent/tickets/${t.id}`;\n  return {\n    source: 'zendesk', sourceId: String(t.id),\n    task: {\n      name: `${clip(t.subject || 'Zendesk ticket', 120)} ${refTag('zendesk', t.id)}`,\n      markdown_description: [`**From Zendesk:** [ticket #${t.id}](${url})`, `**Customer:** ${requester.name || ''} ${requester.email ? `<${requester.email}>` : ''}`.trim(),\n        `**Priority:** ${priority} · **Tags:** ${(t.tags || []).join(', ') || 'none'}`, '', clip(t.description, 3000)].join('\\n'),\n      priority: CLICKUP_PRIORITY[priority], due_date: dueDate(priority, now, cfg), due_date_time: true, tags: ['support', 'zendesk'],\n    },\n  };\n}\n\n// ---------- Intercom ----------\n// Search API results -> conversations that don't have a task yet. seen: { [conversationId]: linkedAtIso } in workflow\n// static data. Ids are only remembered after the task exists (rememberSeen), so a failed ClickUp call is retried\n// on the next run instead of being lost.\nfunction newIntercomConversations(res, seen) {\n  return ((res && res.conversations) || []).filter((conv) => !(seen || {})[conv.id]);\n}\nfunction rememberSeen(seen, ids, now, c) {\n  const cfg = cfgOf(c);\n  const state = { ...(seen || {}) };\n  for (const id of ids) state[id] = new Date(now).toISOString();\n  const all = Object.keys(state);\n  if (all.length > cfg.maxSeen) all.sort((a, b) => state[a].localeCompare(state[b])).slice(0, all.length - cfg.maxSeen).forEach((id) => delete state[id]);\n  return state;\n}\n\nfunction taskFromIntercom(conv, now, c) {\n  const cfg = cfgOf(c);\n  const src = conv.source || {};\n  const author = src.author || {};\n  const priority = conv.priority === 'priority' ? 'high' : 'normal';\n  const url = `https://app.intercom.com/a/inbox/${cfg.intercomAppId}/inbox/conversation/${conv.id}`;\n  const subject = stripHtml(src.subject) || clip(stripHtml(src.body), 80) || 'Intercom conversation';\n  return {\n    source: 'intercom', sourceId: String(conv.id),\n    task: {\n      name: `${clip(subject, 120)} ${refTag('intercom', conv.id)}`,\n      markdown_description: [`**From Intercom:** [conversation ${conv.id}](${url})`, `**Customer:** ${author.name || ''} ${author.email ? `<${author.email}>` : ''}`.trim(),\n        `**Priority:** ${priority}`, '', clip(stripHtml(src.body), 3000)].join('\\n'),\n      priority: CLICKUP_PRIORITY[priority], due_date: dueDate(priority, now, cfg), due_date_time: true, tags: ['support', 'intercom'],\n    },\n  };\n}\n\n// Intercom search for conversations carrying the escalation tag, updated since `sinceSec`.\nfunction intercomSearch(tagId, sinceSec) {\n  return { query: { operator: 'AND', value: [{ field: 'tag_ids', operator: 'IN', value: [String(tagId)] }, { field: 'updated_at', operator: '>', value: sinceSec }] },\n    pagination: { per_page: 50 } };\n}\n\n// ---------- after the task is created ----------\nconst intercomNote = (cfg, text) => ({ message_type: 'note', type: 'admin', admin_id: String(cfg.intercomAdminId), body: `<p>${text.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</p>` });\n\nfunction linkBack(item, task, c) {\n  const cfg = cfgOf(c);\n  if (!task || !task.id) throw new Error(`ClickUp did not return a task for ${item.source} ${item.sourceId}`);\n  const text = `Escalated to ClickUp: ${task.url} (due ${new Date(Number(task.due_date)).toISOString().slice(0, 16).replace('T', ' ')} UTC)`;\n  if (item.source === 'zendesk') return { source: 'zendesk', id: item.sourceId, body: { ticket: { comment: { body: text, public: false }, additional_tags: [cfg.linkedTag] } } };\n  return { source: 'intercom', id: item.sourceId, body: intercomNote(cfg, text) };\n}\n\n// ---------- ClickUp task closed -> note on the source ----------\n// hook: ClickUp webhook payload (taskStatusUpdated). task: GET /task/{id}. Returns null when nothing to do.\nfunction closeNote(hook, task, c) {\n  const cfg = cfgOf(c);\n  const change = ((hook && hook.history_items) || []).find((h) => h.field === 'status');\n  const after = change && change.after;\n  const status = String((after && after.status) || (task.status && task.status.status) || '').toLowerCase();\n  const closed = (after && after.type === 'closed') || cfg.doneStatuses.includes(status);\n  if (!closed) return null;\n  const ref = parseRef(task.name);\n  if (!ref) return null;\n  const text = `ClickUp task \"${task.name.replace(/\\s*\\[.*\\]$/, '')}\" was marked ${status || 'done'}: ${task.url}`;\n  if (ref.source === 'zendesk') return { source: 'zendesk', id: ref.id, body: { ticket: { comment: { body: text, public: false } } } };\n  return { source: 'intercom', id: ref.id, body: intercomNote(cfg, text) };\n}\n\nconst CONFIG = {\"zendeskSubdomain\":\"yourcompany\",\"intercomAppId\":\"your-app-id\",\"intercomAdminId\":\"1234567\",\"linkedTag\":\"clickup_linked\",\"doneStatuses\":[\"complete\",\"closed\",\"done\",\"resolved\"],\"slaHours\":{\"urgent\":4,\"high\":24,\"normal\":72,\"low\":168}};\n\n// ---- Link Back ----\nconst items = $('New Conversations').all().map((i) => i.json);\nconst out = $input.all().map((t, i) => linkBack(items[i], t.json, CONFIG));\nconst store = $getWorkflowStaticData('global');\nstore.seen = rememberSeen(store.seen, out.map((o) => o.id), new Date().toISOString(), CONFIG);\nreturn out.map((json) => ({ json }));\n"
+      }
+    },
+    {
+      "id": "22357c99-e3a2-4fb5-ab7f-fd2d7be34200",
+      "name": "Note on Conversation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "intercomApi": {
+          "id": "INTERCOM_CREDENTIAL_ID",
+          "name": "Intercom API"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.intercom.io/conversations/{{ $json.id }}/reply",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "intercomApi",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Intercom-Version",
+              "value": "2.11"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Every 5 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Search Escalated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Escalated": {
+      "main": [
+        [
+          {
+            "node": "New Conversations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Conversations": {
+      "main": [
+        [
+          {
+            "node": "Create ClickUp Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create ClickUp Task": {
+      "main": [
+        [
+          {
+            "node": "Link Back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Link Back": {
+      "main": [
+        [
+          {
+            "node": "Note on Conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "notes": "Every 5 min: Intercom conversations with the escalation tag -> ClickUp task (once each) -> internal note with the task link."
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "support-escalations-clickup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "n8n workflows: escalated Zendesk tickets and Intercom conversations -> ClickUp tasks with SLA due dates, closed tasks note back to the source.",
+  "scripts": {
+    "build": "node build.mjs",
+    "deploy": "node build.mjs --deploy",
+    "test": "node build.mjs && node --test test/core.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
